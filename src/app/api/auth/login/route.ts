@@ -1,11 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { timingSafeEqual, scryptSync } from 'node:crypto';
 import { createSession } from '@/lib/session';
-import { env } from '@/lib/env';
+import { env, missingEnv } from '@/lib/env';
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null);
   const password = typeof body?.password === 'string' ? body.password : '';
-  const encoded = env().ADMIN_PASSWORD_HASH;
+  let encoded: string;
+  try {
+    encoded = env().ADMIN_PASSWORD_HASH;
+  } catch {
+    // Configuration problems are reported as data, never as an uncaught throw.
+    return NextResponse.json({ error:'Server configuration is incomplete.', configMissing:true, missing:missingEnv() }, { status:503 });
+  }
   // Format: scrypt$<salt-hex>$<derived-key-hex>
   const [scheme, salt, expectedHex] = encoded.split('$');
   if (scheme !== 'scrypt' || !salt || !expectedHex || !/^[a-f0-9]+$/i.test(salt) || !/^[a-f0-9]+$/i.test(expectedHex)) {
