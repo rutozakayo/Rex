@@ -157,3 +157,47 @@ export async function readFileContents(cred: PanelCredential, serverId: string, 
   );
   return response.text();
 }
+
+export type PanelServerDetail = {
+  identifier: string; uuid: string; name: string; description: string;
+  isSuspended: boolean; isInstalling: boolean;
+  limits: { memory: number; disk: number; cpu: number; swap: number; io: number };
+};
+
+export type PanelAllocation = { ip: string; port: number; alias: string | null; primary: boolean };
+
+/** GET /api/client/servers/{id} — authoritative name, description and limits. */
+export async function getServer(cred: PanelCredential, serverId: string): Promise<PanelServerDetail> {
+  const body = await json<{ attributes?: Record<string, unknown> }>(cred, `/api/client/servers/${encodeURIComponent(serverId)}`);
+  const a = (body?.attributes ?? {}) as Record<string, unknown>;
+  if (!a.identifier) throw new PanelError('not_found', 'Pterodactyl did not return that server. Check the server identifier.');
+  const limits = (a.limits ?? {}) as Record<string, number>;
+  return {
+    identifier: String(a.identifier), uuid: String(a.uuid ?? ''), name: String(a.name ?? ''),
+    description: String(a.description ?? ''),
+    isSuspended: Boolean(a.is_suspended), isInstalling: Boolean(a.is_installing),
+    limits: {
+      memory: Number(limits.memory ?? 0), disk: Number(limits.disk ?? 0),
+      cpu: Number(limits.cpu ?? 0), swap: Number(limits.swap ?? 0), io: Number(limits.io ?? 0)
+    }
+  };
+}
+
+/**
+ * GET /api/client/servers/{id}/network/allocations — real network address.
+ * Requires the allocation.read scope; callers treat 403 as "unavailable".
+ */
+export async function listAllocations(cred: PanelCredential, serverId: string): Promise<PanelAllocation[]> {
+  const body = await json<{ data?: Array<{ attributes?: Record<string, unknown> }> }>(
+    cred, `/api/client/servers/${encodeURIComponent(serverId)}/network/allocations`
+  );
+  if (!Array.isArray(body?.data)) throw new PanelError('invalid_response', 'Pterodactyl returned no allocations.');
+  return body.data.map(entry => {
+    const a = (entry.attributes ?? {}) as Record<string, unknown>;
+    return {
+      ip: String(a.ip ?? ''), port: Number(a.port ?? 0),
+      alias: a.ip_alias ? String(a.ip_alias) : null,
+      primary: Boolean(a.is_default ?? a.is_primary)
+    };
+  }).filter(a => a.ip);
+}

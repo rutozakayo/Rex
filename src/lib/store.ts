@@ -11,6 +11,7 @@ export type ConnectionRow = {
   encryptedApiKey: string;
   serverId: string | null;
   serverName: string | null;
+  serverAddress: string | null;
   status: ConnectionStatus;
   permissionsVerified: boolean;
   lastVerifiedAt: Date | null;
@@ -60,12 +61,15 @@ async function ensureSchema(): Promise<void> {
           encrypted_api_key text not null,
           server_id text,
           server_name text,
+          server_address text,
           status text not null default 'disconnected',
           permissions_verified boolean not null default false,
           last_verified_at timestamptz,
           created_at timestamptz not null default now(),
           updated_at timestamptz not null default now()
         )`;
+      // Additive migration for databases created before server_address existed.
+      await sql`alter table panel_connections add column if not exists server_address text`;
     })().catch(err => { migrated = null; throw err; });
   }
   return migrated;
@@ -81,6 +85,7 @@ function toRow(r: DbRow): ConnectionRow {
     encryptedApiKey: String(r.encrypted_api_key),
     serverId: r.server_id ? String(r.server_id) : null,
     serverName: r.server_name ? String(r.server_name) : null,
+    serverAddress: r.server_address ? String(r.server_address) : null,
     status: String(r.status) as ConnectionStatus,
     permissionsVerified: Boolean(r.permissions_verified),
     lastVerifiedAt: r.last_verified_at ? new Date(String(r.last_verified_at)) : null,
@@ -101,30 +106,31 @@ export async function getConnection(adminUserId: string): Promise<ConnectionRow 
 
 export async function upsertConnection(input: {
   adminUserId: string; panelUrl: string; panelUsername: string; encryptedApiKey: string;
-  serverId: string | null; serverName: string | null; status: ConnectionStatus;
-  permissionsVerified: boolean; lastVerifiedAt: Date | null;
+  serverId: string | null; serverName: string | null; serverAddress?: string | null;
+  status: ConnectionStatus; permissionsVerified: boolean; lastVerifiedAt: Date | null;
 }): Promise<void> {
   const mode = storageMode();
   if (mode === 'none') throw new Error('Credential storage is not configured. DATABASE_URL is required in production.');
   if (mode === 'memory') {
     const now = new Date();
     const prev = memory.get(input.adminUserId);
-    memory.set(input.adminUserId, { ...input, createdAt: prev?.createdAt ?? now, updatedAt: now });
+    memory.set(input.adminUserId, { ...input, serverAddress: input.serverAddress ?? null, createdAt: prev?.createdAt ?? now, updatedAt: now });
     return;
   }
   await ensureSchema();
   const sql = client();
   await sql`
     insert into panel_connections
-      (admin_user_id, panel_url, panel_username, encrypted_api_key, server_id, server_name, status, permissions_verified, last_verified_at, updated_at)
+      (admin_user_id, panel_url, panel_username, encrypted_api_key, server_id, server_name, server_address, status, permissions_verified, last_verified_at, updated_at)
     values
-      (${input.adminUserId}, ${input.panelUrl}, ${input.panelUsername}, ${input.encryptedApiKey}, ${input.serverId}, ${input.serverName}, ${input.status}, ${input.permissionsVerified}, ${input.lastVerifiedAt}, now())
+      (${input.adminUserId}, ${input.panelUrl}, ${input.panelUsername}, ${input.encryptedApiKey}, ${input.serverId}, ${input.serverName}, ${input.serverAddress ?? null}, ${input.status}, ${input.permissionsVerified}, ${input.lastVerifiedAt}, now())
     on conflict (admin_user_id) do update set
       panel_url = excluded.panel_url,
       panel_username = excluded.panel_username,
       encrypted_api_key = excluded.encrypted_api_key,
       server_id = excluded.server_id,
       server_name = excluded.server_name,
+      server_address = excluded.server_address,
       status = excluded.status,
       permissions_verified = excluded.permissions_verified,
       last_verified_at = excluded.last_verified_at,
@@ -133,7 +139,7 @@ export async function upsertConnection(input: {
 
 export async function updateConnectionState(adminUserId: string, patch: {
   status: ConnectionStatus; permissionsVerified: boolean; lastVerifiedAt: Date | null;
-  serverId?: string | null; serverName?: string | null;
+  serverId?: string | null; serverName?: string | null; serverAddress?: string | null;
 }): Promise<void> {
   const mode = storageMode();
   if (mode === 'none') return;
@@ -146,6 +152,7 @@ export async function updateConnectionState(adminUserId: string, patch: {
       lastVerifiedAt: patch.lastVerifiedAt,
       serverId: patch.serverId !== undefined ? patch.serverId : prev.serverId,
       serverName: patch.serverName !== undefined ? patch.serverName : prev.serverName,
+      serverAddress: patch.serverAddress !== undefined ? patch.serverAddress : prev.serverAddress,
       updatedAt: new Date()
     });
     return;
@@ -159,6 +166,7 @@ export async function updateConnectionState(adminUserId: string, patch: {
       last_verified_at = ${patch.lastVerifiedAt},
       server_id = coalesce(${patch.serverId ?? null}, server_id),
       server_name = coalesce(${patch.serverName ?? null}, server_name),
+      server_address = coalesce(${patch.serverAddress ?? null}, server_address),
       updated_at = now()
     where admin_user_id = ${adminUserId}`;
 }

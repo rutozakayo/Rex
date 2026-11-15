@@ -1,6 +1,6 @@
 import {
-  PanelError, getAccount, listServers, getServerResources, listDirectory, normalizePanelUrl,
-  type PanelCredential, type PanelServer
+  PanelError, getAccount, getServer, getServerResources, listAllocations, listDirectory,
+  normalizePanelUrl, type PanelCredential, type PanelServerDetail, type PanelResources
 } from './pterodactyl';
 import { decryptSecret, encryptSecret, isEncryptionConfigured } from './crypto';
 import {
@@ -9,22 +9,37 @@ import {
 } from './store';
 import { legacyPanelConfig } from './env';
 
-/** Single-administrator model: the session proves admin, so one row per install. */
+/** Single-administrator, single-server model. */
 export const ADMIN_ID = 'admin';
 
-const BOT_HINTS = [/darknote/i, /whats\s*app/i, /wa[-_ ]?bot/i];
+export type Permissions = { server: boolean; resources: boolean; files: boolean; allocations: boolean };
 
 export type VerifyOutcome = {
   ok: boolean;
   status: ConnectionStatus;
   message: string;
+  notes: string[];
   account?: { username: string; email: string; rootAdmin: boolean };
-  servers?: PanelServer[];
-  candidates?: PanelServer[];
-  selectedServer?: { identifier: string; name: string } | null;
-  permissionsVerified: boolean;
+  server?: { identifier: string; name: string; address: string | null };
+  permissions: Permissions;
   verifiedAt: string | null;
-  needsServerSelection?: boolean;
+};
+
+export type ServerInfo = {
+  name: string;
+  identifier: string;
+  address: string | null;
+  state: string;
+  isSuspended: boolean;
+  cpuAbsolute: number;
+  cpuLimit: number;
+  memoryBytes: number;
+  memoryLimitBytes: number;
+  diskBytes: number;
+  diskLimitBytes: number;
+  uptimeSeconds: number;
+  allocationsReadable: boolean;
+  fetchedAt: string;
 };
 
 const FAIL_STATUS: Record<string, ConnectionStatus> = {
@@ -39,148 +54,141 @@ const FAIL_STATUS: Record<string, ConnectionStatus> = {
   invalid_response: 'panel_unavailable'
 };
 
+const NO_PERMS: Permissions = { server: false, resources: false, files: false, allocations: false };
+
 function failure(err: unknown, fallback: ConnectionStatus = 'panel_unavailable'): { status: ConnectionStatus; message: string } {
   if (err instanceof PanelError) return { status: FAIL_STATUS[err.code] ?? fallback, message: err.message };
   return { status: fallback, message: err instanceof Error ? err.message : 'Panel verification failed.' };
 }
 
-export function detectBotServers(servers: PanelServer[]): PanelServer[] {
-  return servers.filter(s => BOT_HINTS.some(r => r.test(s.name) || r.test(s.description)));
+function addressOf(allocations: { ip: string; port: number; alias: string | null; primary: boolean }[]): string | null {
+  const chosen = allocations.find(a => a.primary) ?? allocations[0];
+  if (!chosen) return null;
+  return `${chosen.ip}:${chosen.port}`;
 }
 
 /**
- * Full verification. Every gate below is a real request against the panel;
- * 'connected' is returned only after account identity, server access and file
- * read permission have all been proven.
+ * Verifies one panel and one server. Every gate is a live request; the caller
+ * only reports CONNECTED after all of them pass.
  */
 export async function verifyPanel(input: {
-  panelUrl: string; username: string; apiKey: string; serverId?: string | null;
+  panelUrl: string; username: string; apiKey: string; serverId: string;
+  serverName?: string; serverAddress?: string;
 }): Promise<VerifyOutcome> {
-  const empty = { permissionsVerified: false, verifiedAt: null as string | null };
+  const base: Omit<VerifyOutcome, 'ok' | 'status' | 'message'> = {
+    notes: [], permissions: { ...NO_PERMS }, verifiedAt: null
+  };
 
-  let base: string;
+  let url: string;
   try {
-    base = normalizePanelUrl(input.panelUrl);
+    url = normalizePanelUrl(input.panelUrl);
   } catch (e) {
-    const f = failure(e, 'invalid_url');
-    return { ok: false, status: 'invalid_url', message: f.message, ...empty };
+    return { ...base, ok: false, status: 'invalid_url', message: failure(e, 'invalid_url').message };
   }
 
   const username = (input.username || '').trim();
   const apiKey = (input.apiKey || '').trim();
-  if (!username) return { ok: false, status: 'authentication_failed', message: 'Panel username is required.', ...empty };
-  if (!apiKey) return { ok: false, status: 'authentication_failed', message: 'A Pterodactyl Client API key is required.', ...empty };
+  const serverId = (input.serverId || '').trim();
+  if (!username) return { ...base, ok: false, status: 'authentication_failed', message: 'Panel username is required.' };
+  if (!apiKey) return { ...base, ok: false, status: 'authentication_failed', message: 'A Pterodactyl Client API key is required.' };
+  if (!serverId) return { ...base, ok: false, status: 'permission_insufficient', message: 'Server ID is required.' };
 
-  const cred: PanelCredential = { base, token: apiKey };
+  const cred: PanelCredential = { base: url, token: apiKey };
 
-  // 1. Identify the account that owns the key.
   let account;
-  try {
-    account = await getAccount(cred);
-  } catch (e) {
-    const f = failure(e);
-    return { ok: false, status: f.status, message: f.message, ...empty };
-  }
+  try { account = await getAccount(cred); }
+  catch (e) { const f = failure(e); return { ...base, ok: false, status: f.status, message: f.message }; }
 
-  // 2. The key must belong to the username the operator typed.
+  const accountView = { username: account.username, email: account.email, rootAdmin: account.rootAdmin };
+
   if (account.username.toLowerCase() !== username.toLowerCase()) {
     return {
-      ok: false, status: 'authentication_failed', ...empty,
+      ...base, ok: false, status: 'authentication_failed', account: accountView,
       message: `This API key belongs to "${account.username}", not "${username}". Use the key created by the matching panel account.`
     };
   }
 
-  // 3. Discover the servers this account can reach.
-  let servers: PanelServer[];
-  try {
-    servers = await listServers(cred);
-  } catch (e) {
-    const f = failure(e);
-    return { ok: false, status: f.status, message: f.message, account: { username: account.username, email: account.email, rootAdmin: account.rootAdmin }, ...empty };
-  }
-
-  if (servers.length === 0) {
+  // The single configured server must be reachable with this key.
+  let server: PanelServerDetail;
+  try { server = await getServer(cred, serverId); }
+  catch (e) {
+    const f = failure(e, 'permission_insufficient');
     return {
-      ok: false, status: 'permission_insufficient', servers, ...empty,
-      account: { username: account.username, email: account.email, rootAdmin: account.rootAdmin },
-      message: 'Verified, but this account cannot see any Pterodactyl servers. Grant it access to the bot server first.'
+      ...base, ok: false, status: f.status, account: accountView,
+      message: e instanceof PanelError && e.code === 'not_found'
+        ? `Server "${serverId}" was not found or is not accessible with this API key.`
+        : `Could not read server "${serverId}": ${f.message}`
     };
   }
 
-  // 4. Choose the target server: explicit choice, else auto-detected bot, else sole server.
-  let chosen: PanelServer | undefined;
-  if (input.serverId) chosen = servers.find(s => s.identifier === input.serverId);
-  if (!chosen) {
-    const detected = detectBotServers(servers);
-    if (detected.length === 1) chosen = detected[0];
-    else if (!input.serverId && servers.length === 1) chosen = servers[0];
-  }
-
-  if (!chosen) {
-    const detected = detectBotServers(servers);
-    return {
-      ok: false, status: 'permission_insufficient', servers, ...empty,
-      account: { username: account.username, email: account.email, rootAdmin: account.rootAdmin },
-      candidates: detected.length ? detected : servers,
-      needsServerSelection: true,
-      message: input.serverId
-        ? `Server "${input.serverId}" is not accessible with this key.`
-        : `Account verified, but no single Darknote/WhatsApp server could be identified among ${servers.length}. Select the correct server.`
-    };
-  }
-
-  // 5. Prove read access to that server's live state.
-  try {
-    await getServerResources(cred, chosen.identifier);
-  } catch (e) {
+  let resources: PanelResources;
+  try { resources = await getServerResources(cred, serverId); }
+  catch (e) {
     const f = failure(e);
     return {
-      ok: false, status: f.status, servers, account: { username: account.username, email: account.email, rootAdmin: account.rootAdmin }, ...empty,
-      message: `Account verified, but server "${chosen.name}" is not readable: ${f.message}`
+      ...base, ok: false, status: f.status, account: accountView,
+      permissions: { ...NO_PERMS, server: true },
+      message: `Server "${server.name}" could not be queried: ${f.message}`
     };
   }
 
-  // 6. Prove file read permission, which the file manager depends on.
-  try {
-    await listDirectory(cred, chosen.identifier, '/');
-  } catch (e) {
+  try { await listDirectory(cred, serverId, '/'); }
+  catch (e) {
     const f = failure(e);
     return {
-      ok: false, status: e instanceof PanelError && (e.code === 'forbidden' || e.code === 'unauthorized') ? 'permission_insufficient' : f.status,
-      servers, account: { username: account.username, email: account.email, rootAdmin: account.rootAdmin }, ...empty,
-      message: `Server access works, but the key cannot read files: ${f.message} Add the file.read scope to the key.`
+      ...base, ok: false, status: e instanceof PanelError && (e.code === 'forbidden' || e.code === 'unauthorized') ? 'permission_insufficient' : f.status,
+      account: accountView, permissions: { ...NO_PERMS, server: true, resources: true },
+      message: `Server state is readable, but files are not: ${f.message} Add the file.read scope to the API key.`
     };
+  }
+
+  // Allocations are optional: without allocation.read the address is unavailable.
+  let address: string | null = null;
+  let allocationsReadable = true;
+  try { address = addressOf(await listAllocations(cred, serverId)); }
+  catch { allocationsReadable = false; }
+
+  const notes: string[] = [];
+  const typedName = (input.serverName || '').trim();
+  if (typedName && typedName.toLowerCase() !== server.name.toLowerCase()) {
+    notes.push(`Panel reports this server as "${server.name}", not "${typedName}". The panel name is authoritative.`);
+  }
+  const typedAddress = (input.serverAddress || '').trim();
+  if (!allocationsReadable) {
+    notes.push('Server address is unavailable: the API key lacks the allocation.read scope.');
+  } else if (typedAddress && address && typedAddress !== address) {
+    notes.push(`Panel reports the primary allocation as ${address}, not ${typedAddress}.`);
   }
 
   return {
     ok: true,
     status: 'connected',
-    message: 'Panel verified: account identity, server access and file permissions all confirmed.',
-    account: { username: account.username, email: account.email, rootAdmin: account.rootAdmin },
-    servers,
-    selectedServer: { identifier: chosen.identifier, name: chosen.name },
-    permissionsVerified: true,
+    message: `Verified "${server.name}" (${resources.currentState}) — account identity, server access and file permissions confirmed.`,
+    notes,
+    account: accountView,
+    server: { identifier: server.identifier, name: server.name, address: address ?? (typedAddress || null) },
+    permissions: { server: true, resources: true, files: true, allocations: allocationsReadable },
     verifiedAt: new Date().toISOString()
   };
 }
 
 export class NotConnectedError extends Error {
-  constructor(message = 'No Pterodactyl panel is connected to this control center.') { super(message); this.name = 'NotConnectedError'; }
+  constructor(message = 'No Pterodactyl server is configured yet.') { super(message); this.name = 'NotConnectedError'; }
 }
 
-/** Encrypts and persists a verified connection. Never called on a failed verify. */
 export async function connectPanel(input: {
-  panelUrl: string; username: string; apiKey: string; serverId?: string | null;
+  panelUrl: string; username: string; apiKey: string; serverId: string;
+  serverName?: string; serverAddress?: string;
 }): Promise<VerifyOutcome> {
   if (!isEncryptionConfigured()) {
     return {
-      ok: false, status: 'disconnected', permissionsVerified: false, verifiedAt: null,
-      message: 'Credential storage is not ready: set PANEL_ENCRYPTION_KEY (32+ random characters) in the server environment. Nothing was saved.'
+      ok: false, status: 'disconnected', notes: [], permissions: { ...NO_PERMS }, verifiedAt: null,
+      message: 'Credential storage is not ready: set PANEL_ENCRYPTION_KEY (32+ random characters). Nothing was saved.'
     };
   }
   if (storageMode() === 'none') {
     return {
-      ok: false, status: 'disconnected', permissionsVerified: false, verifiedAt: null,
+      ok: false, status: 'disconnected', notes: [], permissions: { ...NO_PERMS }, verifiedAt: null,
       message: 'Credential storage is not ready: DATABASE_URL is not configured. Nothing was saved.'
     };
   }
@@ -193,57 +201,91 @@ export async function connectPanel(input: {
     panelUrl: normalizePanelUrl(input.panelUrl),
     panelUsername: outcome.account!.username,
     encryptedApiKey: encryptSecret(input.apiKey.trim()),
-    serverId: outcome.selectedServer!.identifier,
-    serverName: outcome.selectedServer!.name,
+    serverId: outcome.server!.identifier,
+    serverName: outcome.server!.name,
+    serverAddress: outcome.server!.address,
     status: 'connected',
-    permissionsVerified: outcome.permissionsVerified,
+    permissionsVerified: outcome.permissions.resources && outcome.permissions.files,
     lastVerifiedAt: new Date(outcome.verifiedAt!)
   });
   return outcome;
 }
 
-/**
- * Re-runs verification using the stored credential. A stored row is never
- * treated as proof of health: this always makes a live request.
- */
 export async function testStoredConnection(): Promise<VerifyOutcome> {
   const row = await getConnection(ADMIN_ID);
-  if (!row) throw new NotConnectedError();
-  if (row.status === 'disconnected') {
-    return { ok: false, status: 'disconnected', message: 'This connection was disconnected. Reconnect with current credentials.', permissionsVerified: false, verifiedAt: null };
-  }
+  if (!row || !row.serverId) throw new NotConnectedError();
 
   let apiKey: string;
-  try {
-    apiKey = decryptSecret(row.encryptedApiKey);
-  } catch {
+  try { apiKey = decryptSecret(row.encryptedApiKey); }
+  catch {
     return {
-      ok: false, status: 'authentication_failed', permissionsVerified: false, verifiedAt: null,
-      message: 'The stored credential could not be decrypted. PANEL_ENCRYPTION_KEY may have changed — reconnect the panel.'
+      ok: false, status: 'authentication_failed', notes: [], permissions: { ...NO_PERMS }, verifiedAt: null,
+      message: 'The stored credential could not be decrypted. PANEL_ENCRYPTION_KEY may have changed — save the configuration again.'
     };
   }
 
-  const outcome = await verifyPanel({ panelUrl: row.panelUrl, username: row.panelUsername, apiKey, serverId: row.serverId });
+  const outcome = await verifyPanel({
+    panelUrl: row.panelUrl, username: row.panelUsername, apiKey,
+    serverId: row.serverId, serverName: row.serverName ?? undefined
+  });
 
   if (outcome.ok) {
     await updateConnectionState(ADMIN_ID, {
-      status: 'connected', permissionsVerified: true, lastVerifiedAt: new Date(outcome.verifiedAt!),
-      serverId: outcome.selectedServer!.identifier, serverName: outcome.selectedServer!.name
+      status: 'connected',
+      permissionsVerified: outcome.permissions.resources && outcome.permissions.files,
+      lastVerifiedAt: new Date(outcome.verifiedAt!),
+      serverId: outcome.server!.identifier,
+      serverName: outcome.server!.name,
+      serverAddress: outcome.server!.address
     });
-  } else if (outcome.status !== 'disconnected') {
-    // Record the failure but keep the stored credential so the operator can retry.
+  } else {
     await updateConnectionState(ADMIN_ID, { status: outcome.status, permissionsVerified: false, lastVerifiedAt: row.lastVerifiedAt });
   }
   return outcome;
 }
 
-/** Credentials for the file/resource routes. Stored connection wins; env is the legacy fallback. */
+/** Live statistics for the single configured server. Values come from the panel. */
+export async function serverInfo(): Promise<ServerInfo> {
+  const row = await getConnection(ADMIN_ID);
+  if (!row || !row.serverId) throw new NotConnectedError();
+
+  let apiKey: string;
+  try { apiKey = decryptSecret(row.encryptedApiKey); }
+  catch { throw new NotConnectedError('Stored credential cannot be decrypted. Save the configuration again.'); }
+
+  const cred: PanelCredential = { base: row.panelUrl.replace(/\/$/, ''), token: apiKey };
+  const detail = await getServer(cred, row.serverId);
+  const stats = await getServerResources(cred, row.serverId);
+
+  let address: string | null = null;
+  let allocationsReadable = true;
+  try { address = addressOf(await listAllocations(cred, row.serverId)); }
+  catch { allocationsReadable = false; }
+
+  return {
+    name: detail.name,
+    identifier: detail.identifier,
+    address,
+    state: stats.currentState,
+    isSuspended: stats.isSuspended,
+    cpuAbsolute: stats.resources.cpuAbsolute,
+    cpuLimit: detail.limits.cpu,
+    memoryBytes: stats.resources.memoryBytes,
+    memoryLimitBytes: detail.limits.memory * 1024 * 1024,
+    diskBytes: stats.resources.diskBytes,
+    diskLimitBytes: detail.limits.disk * 1024 * 1024,
+    uptimeSeconds: stats.resources.uptime,
+    allocationsReadable,
+    fetchedAt: new Date().toISOString()
+  };
+}
+
 export async function resolveCredentials(): Promise<{ panelUrl: string; apiKey: string; serverId: string }> {
   const row = await getConnection(ADMIN_ID);
   if (row && row.serverId) {
     let apiKey: string;
     try { apiKey = decryptSecret(row.encryptedApiKey); }
-    catch { throw new NotConnectedError('Stored credential cannot be decrypted. Reconnect the panel.'); }
+    catch { throw new NotConnectedError('Stored credential cannot be decrypted. Save the configuration again.'); }
     return { panelUrl: row.panelUrl, apiKey, serverId: row.serverId };
   }
 
@@ -251,7 +293,6 @@ export async function resolveCredentials(): Promise<{ panelUrl: string; apiKey: 
   if (legacy) {
     return { panelUrl: legacy.PTERODACTYL_BASE_URL, apiKey: legacy.PTERODACTYL_CLIENT_API_TOKEN, serverId: legacy.PTERODACTYL_SERVER_ID };
   }
-
   throw new NotConnectedError();
 }
 
@@ -262,10 +303,11 @@ export async function disconnectPanel(): Promise<void> {
 /** Response-safe projection: no API key, no ciphertext, no encryption metadata. */
 export async function publicStatus() {
   const row = await getConnection(ADMIN_ID);
-  const storage = storageMode();
   const base = {
-    storage, encryptionReady: isEncryptionConfigured(),
-    connected: false, status: 'disconnected' as ConnectionStatus
+    storage: storageMode(),
+    encryptionReady: isEncryptionConfigured(),
+    connected: false,
+    status: 'disconnected' as ConnectionStatus
   };
   if (!row) return { ...base };
   return {
@@ -276,6 +318,7 @@ export async function publicStatus() {
     panelUsername: row.panelUsername,
     serverId: row.serverId,
     serverName: row.serverName,
+    serverAddress: row.serverAddress,
     permissionsVerified: row.permissionsVerified,
     lastVerifiedAt: row.lastVerifiedAt ? row.lastVerifiedAt.toISOString() : null,
     updatedAt: row.updatedAt.toISOString()

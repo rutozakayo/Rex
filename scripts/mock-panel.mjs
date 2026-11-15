@@ -6,10 +6,10 @@ import { readFileSync } from 'node:fs';
 const PORT = Number(process.argv[2] || 4020);
 
 const ACCOUNTS = {
-  'valid-key-123456': { id: 1, username: 'zakayo', email: 'zakayo@example.com', admin: true },
-  'multi-key-123456': { id: 2, username: 'zakayo', email: 'zakayo@example.com', admin: false },
-  'noperm-key-12345': { id: 3, username: 'zakayo', email: 'zakayo@example.com', admin: false },
-  'nofile-key-12345': { id: 4, username: 'zakayo', email: 'zakayo@example.com', admin: false }
+  'valid-key-123456': { id: 1, username: 'paneladmin', email: 'paneladmin@example.com', admin: true },
+  'multi-key-123456': { id: 2, username: 'paneladmin', email: 'paneladmin@example.com', admin: false },
+  'noperm-key-12345': { id: 3, username: 'paneladmin', email: 'paneladmin@example.com', admin: false },
+  'nofile-key-12345': { id: 4, username: 'paneladmin', email: 'paneladmin@example.com', admin: false }
 };
 
 const BOT = { identifier: 'a1b2c3d4', uuid: 'uuid-bot', name: 'Darknote WhatsApp Bot', description: 'Production bot', limits: { memory: 2048, disk: 10240, cpu: 100 }, is_suspended: false, is_installing: false };
@@ -43,9 +43,26 @@ const server = createServer({ key: readFileSync('.test-tls/key.pem'), cert: read
     return send(res, 200, { object: 'list', data });
   }
 
-  const m = url.pathname.match(/^\/api\/client\/servers\/([^/]+)\/(resources|files\/list)$/);
+  const m = url.pathname.match(/^\/api\/client\/servers\/([^/]+)(?:\/(resources|files\/list|network\/allocations))?$/);
   if (m) {
     const identifier = decodeURIComponent(m[1]);
+    if (identifier !== BOT.identifier && identifier !== 'q1w2e3r4' && identifier !== 'z9y8x7w6') {
+      return send(res, 404, { errors: [{ detail: 'Server not found.' }] });
+    }
+    if (!m[2]) {
+      // This key has no access to any server, which the single-server flow
+      // detects on the server-detail call.
+      if (auth === 'noperm-key-12345') return send(res, 403, { errors: [{ detail: 'Forbidden.' }] });
+      const target = identifier === BOT.identifier ? BOT : identifier === 'q1w2e3r4' ? SECOND : OTHER;
+      return send(res, 200, { object: 'server', attributes: target });
+    }
+    if (m[2] === 'network/allocations') {
+      if (auth === 'nofile-key-12345') return send(res, 403, { errors: [{ detail: 'Forbidden.' }] });
+      return send(res, 200, { object: 'list', data: [
+        { object: 'allocation', attributes: { id: 1, ip: '203.0.113.10', ip_alias: 'node.example.com', port: 25565, notes: null, is_default: true } },
+        { object: 'allocation', attributes: { id: 2, ip: '203.0.113.10', ip_alias: null, port: 25566, notes: null, is_default: false } }
+      ] });
+    }
     if (m[2] === 'resources') return send(res, 200, STATS);
     if (m[2] === 'files/list') {
       if (auth === 'nofile-key-12345') return send(res, 403, { errors: [{ detail: 'Forbidden.' }] });

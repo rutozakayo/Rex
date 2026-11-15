@@ -50,6 +50,7 @@ create table if not exists panel_connections (
  encrypted_api_key text not null,
  server_id text,
  server_name text,
+ server_address text,
  status text not null default 'disconnected'
    check (status in ('connected','verifying','authentication_failed','invalid_url','permission_insufficient','panel_unavailable','disconnected')),
  permissions_verified boolean not null default false,
@@ -58,3 +59,5 @@ create table if not exists panel_connections (
  updated_at timestamptz not null default now()
 );
 create index if not exists panel_connections_status_idx on panel_connections(status);
+-- Additive migration for databases created before server_address existed.
+alter table panel_connections add column if not exists server_address text;

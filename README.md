@@ -75,11 +75,16 @@ Run `database/schema.sql` against your Neon database using the Neon SQL editor. 
 
 Sign in with the website password, then complete the **Pterodactyl connection** card on the dashboard.
 
+One panel, one server — there is no server list and no switching between servers.
+
 | Field | What it is |
 | --- | --- |
 | Panel URL | Full HTTPS URL, e.g. `https://panel.example.com` |
 | Panel username | The exact username of the panel account that owns the API key |
-| Client API key | Created in the panel under **Account → API Credentials** |
+| Server name | Optional label; the panel's own name is authoritative and is what gets stored |
+| Server ID | The Pterodactyl server identifier (short ID), e.g. `a1b2c3d4` |
+| Server address | Optional; the primary allocation from the panel is used when readable |
+| Client API key | Created in the panel under **Account → API Credentials**, scopes `file.read` and `allocation.read` |
 
 ### Why an API key and not the panel password
 
@@ -90,12 +95,12 @@ Pterodactyl exposes no API that accepts a username and password; its Client API 
 1. The URL is valid HTTPS.
 2. `GET /api/client` succeeds and returns the key owner's identity.
 3. That identity matches the username supplied.
-4. `GET /api/client/servers` lists the servers the account can reach.
-5. The Darknote/WhatsApp server is identified (auto-detected, or chosen from a list when ambiguous).
-6. `GET /api/client/servers/{id}/resources` proves server read access.
-7. `GET /api/client/servers/{id}/files/list` proves the `file.read` permission.
+4. `GET /api/client/servers/{id}` returns the configured server (name, limits, state).
+5. `GET /api/client/servers/{id}/resources` proves server read access.
+6. `GET /api/client/servers/{id}/files/list` proves the `file.read` permission.
+7. `GET /api/client/servers/{id}/network/allocations` resolves the real address (optional; without `allocation.read` the address is reported as unavailable).
 
-`CONNECTED` is only reported after all seven succeed. Failed verification never persists anything and returns one of: `invalid_url`, `authentication_failed`, `permission_insufficient`, `panel_unavailable`.
+`CONNECTED` is only reported after these gates succeed. Failed verification never persists anything and returns one of: `invalid_url`, `authentication_failed`, `permission_insufficient`, `panel_unavailable`.
 
 ### Required environment variables
 
@@ -116,5 +121,5 @@ Generate secrets with `openssl rand -base64 48`. Website login needs only the fi
 
 ```bash
 node scripts/mock-panel.mjs 4020          # local HTTPS mock of the Client API
-node scripts/test-panel-flow.mjs          # 36 assertions across every failure mode
+TEST_ADMIN_PASSWORD=<password> node scripts/test-panel-flow.mjs   # 40 assertions
 ```
