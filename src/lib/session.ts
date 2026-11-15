@@ -1,8 +1,8 @@
 import { SignJWT, jwtVerify } from 'jose';
 import { cookies } from 'next/headers';
-import { env } from './env';
+import { authEnv } from './env';
 const COOKIE = 'darknote_admin';
-const secret = () => new TextEncoder().encode(env().ADMIN_SESSION_SECRET);
+const secret = () => new TextEncoder().encode(authEnv().ADMIN_SESSION_SECRET);
 export async function createSession() {
   const token = await new SignJWT({ role: 'admin' }).setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt().setExpirationTime('8h').sign(secret());
