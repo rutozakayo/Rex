@@ -70,3 +70,56 @@ Run `database/schema.sql` against your Neon database using the Neon SQL editor. 
 - File paths are normalized and traversal attempts are rejected.
 - Read-only mode is deliberate until the full deployment safety chain exists.
 - Add rate limiting, login lockout, CSRF/origin checks, MFA and a managed secret store before public production exposure.
+
+## Connecting a Pterodactyl panel
+
+Sign in with the website password, then complete the **Pterodactyl connection** card on the dashboard.
+
+One panel, one server — there is no server list and no switching between servers.
+
+| Field | What it is |
+| --- | --- |
+| Panel URL | Full HTTPS URL, e.g. `https://panel.example.com` |
+| Panel username | The exact username of the panel account that owns the API key |
+| Server name | Optional label; the panel's own name is authoritative and is what gets stored |
+| Server ID | The Pterodactyl server identifier (short ID), e.g. `a1b2c3d4` |
+| Server address | Optional; the primary allocation from the panel is used when readable |
+| Client API key | Created in the panel under **Account → API Credentials**, scopes `file.read` and `allocation.read` |
+
+### Why an API key and not the panel password
+
+Pterodactyl exposes no API that accepts a username and password; its Client API authenticates only with a Bearer API key. Verifying a panel password would mean scripting the panel's web login form, which is unsupported and unsafe. The key's owning account is read from `GET /api/client` and compared with the username you enter, so the connection is genuinely bound to that account — a wrong username fails verification.
+
+### What verification proves before anything is saved
+
+1. The URL is valid HTTPS.
+2. `GET /api/client` succeeds and returns the key owner's identity.
+3. That identity matches the username supplied.
+4. `GET /api/client/servers/{id}` returns the configured server (name, limits, state).
+5. `GET /api/client/servers/{id}/resources` proves server read access.
+6. `GET /api/client/servers/{id}/files/list` proves the `file.read` permission.
+7. `GET /api/client/servers/{id}/network/allocations` resolves the real address (optional; without `allocation.read` the address is reported as unavailable).
+
+`CONNECTED` is only reported after these gates succeed. Failed verification never persists anything and returns one of: `invalid_url`, `authentication_failed`, `permission_insufficient`, `panel_unavailable`.
+
+### Required environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `ADMIN_PASSWORD_HASH` | scrypt hash from `scripts/hash-password.mjs` |
+| `ADMIN_SESSION_SECRET` | 32+ random characters, signs the session JWT |
+| `PANEL_ENCRYPTION_KEY` | 32+ random characters, AES-256-GCM key for the stored API key |
+| `DATABASE_URL` | Neon connection string; stores connection metadata |
+
+Generate secrets with `openssl rand -base64 48`. Website login needs only the first two; the panel is attached through the UI, not through environment variables.
+
+`PTERODACTYL_BASE_URL`, `PTERODACTYL_CLIENT_API_TOKEN` and `PTERODACTYL_SERVER_ID` remain supported as a single-panel fallback for existing deployments.
+
+`PANEL_STORE=memory` is a development-only override that keeps connection state in process memory. Never use it in production.
+
+### Tests
+
+```bash
+node scripts/mock-panel.mjs 4020          # local HTTPS mock of the Client API
+TEST_ADMIN_PASSWORD=<password> node scripts/test-panel-flow.mjs   # 40 assertions
+```

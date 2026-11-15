@@ -38,3 +38,26 @@ create table if not exists sync_conflicts (
  path text not null, base_sha256 text, remote_sha256 text, draft_sha256 text,
  status text not null default 'open', created_at timestamptz not null default now()
 );
+
+-- Per-administrator Pterodactyl connection metadata.
+-- The API key is stored as AES-256-GCM ciphertext (PANEL_ENCRYPTION_KEY);
+-- no plaintext credential, password or token is ever written to these columns.
+create table if not exists panel_connections (
+ id uuid primary key default gen_random_uuid(),
+ admin_user_id text not null unique,
+ panel_url text not null,
+ panel_username text not null,
+ encrypted_api_key text not null,
+ server_id text,
+ server_name text,
+ server_address text,
+ status text not null default 'disconnected'
+   check (status in ('connected','verifying','authentication_failed','invalid_url','permission_insufficient','panel_unavailable','disconnected')),
+ permissions_verified boolean not null default false,
+ last_verified_at timestamptz,
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+create index if not exists panel_connections_status_idx on panel_connections(status);
+-- Additive migration for databases created before server_address existed.
+alter table panel_connections add column if not exists server_address text;
