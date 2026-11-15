@@ -70,3 +70,51 @@ Run `database/schema.sql` against your Neon database using the Neon SQL editor. 
 - File paths are normalized and traversal attempts are rejected.
 - Read-only mode is deliberate until the full deployment safety chain exists.
 - Add rate limiting, login lockout, CSRF/origin checks, MFA and a managed secret store before public production exposure.
+
+## Connecting a Pterodactyl panel
+
+Sign in with the website password, then complete the **Pterodactyl connection** card on the dashboard.
+
+| Field | What it is |
+| --- | --- |
+| Panel URL | Full HTTPS URL, e.g. `https://panel.example.com` |
+| Panel username | The exact username of the panel account that owns the API key |
+| Client API key | Created in the panel under **Account → API Credentials** |
+
+### Why an API key and not the panel password
+
+Pterodactyl exposes no API that accepts a username and password; its Client API authenticates only with a Bearer API key. Verifying a panel password would mean scripting the panel's web login form, which is unsupported and unsafe. The key's owning account is read from `GET /api/client` and compared with the username you enter, so the connection is genuinely bound to that account — a wrong username fails verification.
+
+### What verification proves before anything is saved
+
+1. The URL is valid HTTPS.
+2. `GET /api/client` succeeds and returns the key owner's identity.
+3. That identity matches the username supplied.
+4. `GET /api/client/servers` lists the servers the account can reach.
+5. The Darknote/WhatsApp server is identified (auto-detected, or chosen from a list when ambiguous).
+6. `GET /api/client/servers/{id}/resources` proves server read access.
+7. `GET /api/client/servers/{id}/files/list` proves the `file.read` permission.
+
+`CONNECTED` is only reported after all seven succeed. Failed verification never persists anything and returns one of: `invalid_url`, `authentication_failed`, `permission_insufficient`, `panel_unavailable`.
+
+### Required environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `ADMIN_PASSWORD_HASH` | scrypt hash from `scripts/hash-password.mjs` |
+| `ADMIN_SESSION_SECRET` | 32+ random characters, signs the session JWT |
+| `PANEL_ENCRYPTION_KEY` | 32+ random characters, AES-256-GCM key for the stored API key |
+| `DATABASE_URL` | Neon connection string; stores connection metadata |
+
+Generate secrets with `openssl rand -base64 48`. Website login needs only the first two; the panel is attached through the UI, not through environment variables.
+
+`PTERODACTYL_BASE_URL`, `PTERODACTYL_CLIENT_API_TOKEN` and `PTERODACTYL_SERVER_ID` remain supported as a single-panel fallback for existing deployments.
+
+`PANEL_STORE=memory` is a development-only override that keeps connection state in process memory. Never use it in production.
+
+### Tests
+
+```bash
+node scripts/mock-panel.mjs 4020          # local HTTPS mock of the Client API
+node scripts/test-panel-flow.mjs          # 36 assertions across every failure mode
+```
